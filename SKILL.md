@@ -55,6 +55,7 @@ Returns `{"status": "ok", "agent": "main", "name": "Sancho"}`. The `name` field 
 | Variable | Default | Description |
 |---|---|---|
 | `OPENCLAW_GATEWAY_TOKEN` | *(required)* | Gateway auth token |
+| `VOICE_CHAT_TOKEN` | *(none)* | Bearer token for client auth (if unset, no auth) |
 | `OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | Gateway URL |
 | `VOICE_CHAT_PORT` | `8766` | Server listen port |
 | `VOICE_CHAT_BIND` | `0.0.0.0` | Bind address |
@@ -97,6 +98,16 @@ The companion Android app ([ClawVoice](https://github.com/mattmanning/clawvoice)
 - Configurable server URL in Settings
 
 Set the server URL in the app to `http://<your-openclaw-host-ip>:8766`.
+
+## Authentication
+
+Set `VOICE_CHAT_TOKEN` to require a bearer token on all endpoints except `/health`. Clients must send:
+
+```
+Authorization: Bearer <your-token>
+```
+
+`/health` remains unauthenticated so the app can discover the agent name before authenticating.
 
 ## Troubleshooting
 

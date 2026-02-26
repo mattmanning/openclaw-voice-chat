@@ -31,6 +31,7 @@ const AGENT_ID = process.env.OPENCLAW_AGENT_ID || 'main';
 const SYSTEM_PROMPT = process.env.VOICE_CHAT_SYSTEM || null;
 const READ_TIMEOUT = parseInt(process.env.VOICE_CHAT_TIMEOUT || '60000', 10);
 const AGENT_NAME = process.env.VOICE_CHAT_AGENT_NAME || 'Assistant';
+const AUTH_TOKEN = process.env.VOICE_CHAT_TOKEN || null;
 
 if (!GATEWAY_TOKEN) {
   console.error('ERROR: OPENCLAW_GATEWAY_TOKEN is required.');
@@ -134,16 +135,25 @@ const server = http.createServer(async (req, res) => {
   // CORS headers for flexibility
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     return res.end();
   }
 
-  // Health check
+  // Health check (unauthenticated — safe for discovery)
   if (req.method === 'GET' && req.url === '/health') {
     return jsonResponse(res, 200, { status: 'ok', agent: AGENT_ID, name: AGENT_NAME });
+  }
+
+  // Auth check for all other endpoints
+  if (AUTH_TOKEN) {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (token !== AUTH_TOKEN) {
+      return jsonResponse(res, 401, { status: 'error', error: 'Unauthorized' });
+    }
   }
 
   // Main text endpoint
@@ -178,5 +188,6 @@ server.listen(PORT, BIND, () => {
   console.log(`Voice Chat Bridge listening on ${BIND}:${PORT}`);
   console.log(`  Gateway: ${GATEWAY_URL} (agent: ${AGENT_ID})`);
   console.log(`  Name: ${AGENT_NAME}`);
+  console.log(`  Auth: ${AUTH_TOKEN ? 'enabled' : 'disabled (set VOICE_CHAT_TOKEN to enable)'}`);
   console.log(`  Timeout: ${READ_TIMEOUT}ms`);
 });

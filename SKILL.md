@@ -62,6 +62,7 @@ Returns `{"status": "ok", "agent": "main", "name": "Sancho"}`. The `name` field 
 | `OPENCLAW_AGENT_ID` | `main` | Agent to route messages to |
 | `VOICE_CHAT_SYSTEM` | *(none)* | Optional system prompt override |
 | `VOICE_CHAT_AGENT_NAME` | `Assistant` | Agent name returned by `/health` |
+| `VOICE_CHAT_USER` | `voice-chat` | Stable user ID for session continuity |
 | `VOICE_CHAT_TIMEOUT` | `60000` | Gateway request timeout (ms) |
 
 ## Running as a Service

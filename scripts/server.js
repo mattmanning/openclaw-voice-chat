@@ -32,6 +32,7 @@ const SYSTEM_PROMPT = process.env.VOICE_CHAT_SYSTEM || null;
 const READ_TIMEOUT = parseInt(process.env.VOICE_CHAT_TIMEOUT || '60000', 10);
 const AGENT_NAME = process.env.VOICE_CHAT_AGENT_NAME || 'Assistant';
 const AUTH_TOKEN = process.env.VOICE_CHAT_TOKEN || null;
+const SESSION_USER = process.env.VOICE_CHAT_USER || 'voice-chat';
 
 if (!GATEWAY_TOKEN) {
   console.error('ERROR: OPENCLAW_GATEWAY_TOKEN is required.');
@@ -86,6 +87,7 @@ async function askGateway(text) {
     model: `openclaw:${AGENT_ID}`,
     messages,
     stream: false,
+    user: SESSION_USER,
   });
 
   return new Promise((resolve, reject) => {
@@ -188,6 +190,7 @@ server.listen(PORT, BIND, () => {
   console.log(`Voice Chat Bridge listening on ${BIND}:${PORT}`);
   console.log(`  Gateway: ${GATEWAY_URL} (agent: ${AGENT_ID})`);
   console.log(`  Name: ${AGENT_NAME}`);
+  console.log(`  Session user: ${SESSION_USER}`);
   console.log(`  Auth: ${AUTH_TOKEN ? 'enabled' : 'disabled (set VOICE_CHAT_TOKEN to enable)'}`);
   console.log(`  Timeout: ${READ_TIMEOUT}ms`);
 });

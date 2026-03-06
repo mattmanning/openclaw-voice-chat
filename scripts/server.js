@@ -28,6 +28,7 @@
  *   VOICE_CHAT_TOKEN       (optional client auth token)
  *   VOICE_CHAT_USER        (default voice-chat, for session continuity)
  *   VOICE_CHAT_TIMEOUT     (default 60000ms)
+ *   VOICE_CHAT_GREETING    (optional custom greeting text; if not set, auto-generates)
  */
 
 const http = require('http');
@@ -47,6 +48,14 @@ const READ_TIMEOUT = parseInt(process.env.VOICE_CHAT_TIMEOUT || '60000', 10);
 const AGENT_NAME = process.env.VOICE_CHAT_AGENT_NAME || 'Assistant';
 const AUTH_TOKEN = process.env.VOICE_CHAT_TOKEN || null;
 const SESSION_USER = process.env.VOICE_CHAT_USER || 'voice-chat';
+const GREETING = process.env.VOICE_CHAT_GREETING || null;
+
+// Default voice system prompt — keeps responses concise and voice-friendly
+const DEFAULT_VOICE_SYSTEM = [
+  `You are ${AGENT_NAME}, a voice assistant. Keep responses brief and conversational — 2-3 sentences max unless asked for detail.`,
+  'No emoji, no URLs, no markdown, no bullet lists. Speak naturally like you\'re on the phone.',
+  'Use plain spoken language. Say numbers and abbreviations out loud (e.g. "two hundred" not "200").',
+].join(' ');
 
 if (!GATEWAY_TOKEN) {
   console.error('ERROR: OPENCLAW_GATEWAY_TOKEN is required.');
@@ -126,13 +135,41 @@ function checkAuthFromUrl(url) {
   }
 }
 
+// --- Text sanitizer for voice output -------------------------------------- //
+
+/** Strip emoji, URLs, markdown, and other non-voice-friendly content. */
+function sanitizeForVoice(text) {
+  return text
+    // Remove URLs
+    .replace(/https?:\/\/\S+/gi, '')
+    // Remove markdown links [text](url)
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    // Remove markdown bold/italic
+    .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
+    .replace(/_{1,3}([^_]+)_{1,3}/g, '$1')
+    // Remove markdown headers
+    .replace(/^#{1,6}\s+/gm, '')
+    // Remove markdown code blocks and inline code
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/`([^`]+)`/g, '$1')
+    // Remove bullet list markers
+    .replace(/^[\s]*[-*•]\s+/gm, '')
+    // Remove numbered list markers
+    .replace(/^[\s]*\d+[.)]\s+/gm, '')
+    // Remove emoji (Unicode emoji ranges)
+    .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]/gu, '')
+    // Collapse multiple spaces/newlines
+    .replace(/\n{2,}/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 // --- Gateway communication ------------------------------------------------ //
 
 function buildMessages(text) {
   const messages = [];
-  if (SYSTEM_PROMPT) {
-    messages.push({ role: 'system', content: SYSTEM_PROMPT });
-  }
+  const systemPrompt = SYSTEM_PROMPT || DEFAULT_VOICE_SYSTEM;
+  messages.push({ role: 'system', content: systemPrompt });
   messages.push({ role: 'user', content: text });
   return messages;
 }
@@ -297,7 +334,8 @@ const server = http.createServer(async (req, res) => {
         return jsonResponse(res, 400, { status: 'error', error: 'Missing "text" field' });
       }
       console.log(`[${ts()}] HTTP → ${text.slice(0, 120)}`);
-      const response = await askGateway(text);
+      const rawResponse = await askGateway(text);
+      const response = sanitizeForVoice(rawResponse);
       console.log(`[${ts()}] HTTP ← ${response.slice(0, 120)}`);
       return jsonResponse(res, 200, { input: text, status: 'ok', response });
     } catch (err) {
@@ -306,8 +344,50 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Greeting endpoint — returns a short spoken greeting
+  if (req.method === 'GET' && (req.url === '/greet' || req.url?.startsWith('/greet?'))) {
+    if (AUTH_TOKEN && !checkAuth(req) && !checkAuthFromUrl(req.url)) {
+      return jsonResponse(res, 401, { status: 'error', error: 'Unauthorized' });
+    }
+    try {
+      const greeting = await getGreeting();
+      console.log(`[${ts()}] GREET ← ${greeting.slice(0, 120)}`);
+      return jsonResponse(res, 200, { status: 'ok', greeting });
+    } catch (err) {
+      console.error(`[${ts()}] GREET ERROR:`, err.message);
+      return jsonResponse(res, 502, { status: 'error', error: err.message });
+    }
+  }
+
   jsonResponse(res, 404, { status: 'error', error: 'Not found' });
 });
+
+/**
+ * Generate a contextual greeting. Uses a static greeting if configured,
+ * otherwise asks the agent for a brief one.
+ */
+async function getGreeting() {
+  if (GREETING) return GREETING;
+
+  const hour = new Date().getHours();
+  const timeOfDay = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening';
+
+  try {
+    const response = await askGateway(
+      `[SYSTEM: The user just opened the voice app. Give a brief, natural greeting for the ${timeOfDay}. ` +
+      `One sentence max. Be warm but casual. Don't ask how you can help — just greet them like a friend.]`
+    );
+    return sanitizeForVoice(response);
+  } catch {
+    // Fallback if gateway is slow/down
+    const greetings = {
+      morning: `Good morning! ${AGENT_NAME} here.`,
+      afternoon: `Hey there! ${AGENT_NAME} here.`,
+      evening: `Good evening! ${AGENT_NAME} here.`,
+    };
+    return greetings[timeOfDay];
+  }
+}
 
 // --- WebSocket Server ----------------------------------------------------- //
 
@@ -332,8 +412,21 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // Handle greeting request
+    if (msg.type === 'greet') {
+      console.log(`[${ts()}] WS → greet`);
+      getGreeting().then((greeting) => {
+        console.log(`[${ts()}] WS ← greet: ${greeting.slice(0, 80)}`);
+        wsSend(ws, { type: 'greeting', text: greeting });
+      }).catch((err) => {
+        console.error(`[${ts()}] WS GREET ERROR:`, err.message);
+        wsSend(ws, { type: 'greeting', text: `Hey! ${AGENT_NAME} here.` });
+      });
+      return;
+    }
+
     if (msg.type !== 'text' || !msg.text) {
-      wsSend(ws, { type: 'error', error: 'Expected {"type":"text","text":"..."}' });
+      wsSend(ws, { type: 'error', error: 'Expected {"type":"text","text":"..."} or {"type":"greet"}' });
       return;
     }
 
@@ -362,7 +455,9 @@ wss.on('connection', (ws, req) => {
         const { sentences, remainder } = extractSentences(tokenBuffer);
         tokenBuffer = remainder;
 
-        for (const sentence of sentences) {
+        for (const rawSentence of sentences) {
+          const sentence = sanitizeForVoice(rawSentence);
+          if (!sentence) continue; // skip if sanitization removed everything
           console.log(`[${ts()}] WS ← [${sentenceIndex}] ${sentence.slice(0, 80)}`);
           wsSend(ws, { type: 'sentence', text: sentence, index: sentenceIndex++ });
         }
@@ -374,14 +469,14 @@ wss.on('connection', (ws, req) => {
         activeRequest = null;
 
         // Flush any remaining text as a final sentence
-        const remaining = tokenBuffer.trim();
+        const remaining = sanitizeForVoice(tokenBuffer);
         if (remaining) {
           console.log(`[${ts()}] WS ← [${sentenceIndex}] ${remaining.slice(0, 80)}`);
           wsSend(ws, { type: 'sentence', text: remaining, index: sentenceIndex++ });
         }
 
         console.log(`[${ts()}] WS ← done (${sentenceIndex} sentences)`);
-        wsSend(ws, { type: 'done', fullText });
+        wsSend(ws, { type: 'done', fullText: sanitizeForVoice(fullText) });
       },
       // onError
       (err) => {

@@ -90,6 +90,16 @@ systemctl --user daemon-reload
 systemctl --user enable --now voice-chat
 ```
 
+## Voice Response Guidelines
+
+When responding via voice (TTS playback), follow these rules:
+
+- **Keep it brief and conversational.** Voice listeners can't skim — respect their time.
+- **No emoji.** TTS engines read them out by name ("thumbs up sign", "donkey face") which is confusing.
+- **No markdown formatting.** No headers, bold, bullet lists, code blocks. Just plain spoken language.
+- **Front-load the answer.** Say the important thing first, then elaborate if needed.
+- **Be natural.** Write the way you'd speak, not the way you'd type.
+
 ## Android App (ClawVoice)
 
 The companion Android app ([ClawVoice](https://github.com/mattmanning/clawvoice)) provides:

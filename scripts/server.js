@@ -29,12 +29,21 @@
  *   VOICE_CHAT_USER        (default voice-chat, for session continuity)
  *   VOICE_CHAT_TIMEOUT     (default 60000ms)
  *   VOICE_CHAT_GREETING    (optional custom greeting text; if not set, auto-generates)
+ *   WHISPER_SERVICE_URL    (default http://localhost:8790)
+ *
+ * Audio (WebSocket):
+ *   Send:    {"type":"audio","data":"<base64 PCM>","sampleRate":16000}
+ *   Send:    {"type":"end_of_speech"}
+ *   Receive: {"type":"transcript","text":"...","final":false}
+ *             {"type":"transcript","text":"...","final":true}
+ *             (then streamed sentence/done messages from LLM)
  */
 
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 const { WebSocketServer } = require('ws');
+const crypto = require('crypto');
 
 // --- Config --------------------------------------------------------------- //
 
@@ -49,6 +58,7 @@ const AGENT_NAME = process.env.VOICE_CHAT_AGENT_NAME || 'Assistant';
 const AUTH_TOKEN = process.env.VOICE_CHAT_TOKEN || null;
 const SESSION_USER = process.env.VOICE_CHAT_USER || 'voice-chat';
 const GREETING = process.env.VOICE_CHAT_GREETING || null;
+const WHISPER_SERVICE_URL = process.env.WHISPER_SERVICE_URL || 'http://localhost:8790';
 
 // Default voice system prompt — keeps responses concise and voice-friendly
 const DEFAULT_VOICE_SYSTEM = [
@@ -133,6 +143,58 @@ function checkAuthFromUrl(url) {
   } catch {
     return false;
   }
+}
+
+// --- Whisper sidecar helpers ---------------------------------------------- //
+
+/**
+ * POST JSON to the whisper sidecar and return the parsed response.
+ */
+function whisperRequest(path, body) {
+  const url = new URL(path, WHISPER_SERVICE_URL);
+  const transport = url.protocol === 'https:' ? https : http;
+  const payload = JSON.stringify(body);
+
+  return new Promise((resolve, reject) => {
+    const req = transport.request(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 30000,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (res.statusCode !== 200) {
+          return reject(new Error(`Whisper ${res.statusCode}: ${raw.slice(0, 300)}`));
+        }
+        try {
+          resolve(JSON.parse(raw));
+        } catch (e) {
+          reject(new Error(`Bad whisper response: ${e.message}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Whisper request timed out')); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+function whisperSendChunk(sessionId, base64Audio) {
+  return whisperRequest('/transcribe/chunk', { session_id: sessionId, audio: base64Audio });
+}
+
+function whisperFinalize(sessionId) {
+  return whisperRequest('/transcribe/finalize', { session_id: sessionId });
+}
+
+function whisperCancel(sessionId) {
+  return whisperRequest('/transcribe/cancel', { session_id: sessionId });
 }
 
 // --- Text sanitizer for voice output -------------------------------------- //
@@ -400,39 +462,15 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  console.log(`[${ts()}] WS connected`);
+  const whisperSessionId = crypto.randomUUID();
+  console.log(`[${ts()}] WS connected (session=${whisperSessionId})`);
   let activeRequest = null;
 
-  ws.on('message', (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      wsSend(ws, { type: 'error', error: 'Invalid JSON' });
-      return;
-    }
-
-    // Handle greeting request
-    if (msg.type === 'greet') {
-      console.log(`[${ts()}] WS → greet`);
-      getGreeting().then((greeting) => {
-        console.log(`[${ts()}] WS ← greet: ${greeting.slice(0, 80)}`);
-        wsSend(ws, { type: 'greeting', text: greeting });
-      }).catch((err) => {
-        console.error(`[${ts()}] WS GREET ERROR:`, err.message);
-        wsSend(ws, { type: 'greeting', text: `Hey! ${AGENT_NAME} here.` });
-      });
-      return;
-    }
-
-    if (msg.type !== 'text' || !msg.text) {
-      wsSend(ws, { type: 'error', error: 'Expected {"type":"text","text":"..."} or {"type":"greet"}' });
-      return;
-    }
-
-    const text = msg.text;
-    console.log(`[${ts()}] WS → ${text.slice(0, 120)}`);
-
+  /**
+   * Stream an LLM response for the given text back over the WebSocket.
+   * Shared by both the text and audio paths.
+   */
+  function streamLLMResponse(text) {
     // Cancel any in-flight request
     if (activeRequest) {
       try { activeRequest.destroy(); } catch {}
@@ -457,7 +495,7 @@ wss.on('connection', (ws, req) => {
 
         for (const rawSentence of sentences) {
           const sentence = sanitizeForVoice(rawSentence);
-          if (!sentence) continue; // skip if sanitization removed everything
+          if (!sentence) continue;
           console.log(`[${ts()}] WS ← [${sentenceIndex}] ${sentence.slice(0, 80)}`);
           wsSend(ws, { type: 'sentence', text: sentence, index: sentenceIndex++ });
         }
@@ -468,7 +506,6 @@ wss.on('connection', (ws, req) => {
         done = true;
         activeRequest = null;
 
-        // Flush any remaining text as a final sentence
         const remaining = sanitizeForVoice(tokenBuffer);
         if (remaining) {
           console.log(`[${ts()}] WS ← [${sentenceIndex}] ${remaining.slice(0, 80)}`);
@@ -487,14 +524,92 @@ wss.on('connection', (ws, req) => {
         wsSend(ws, { type: 'error', error: err.message });
       }
     );
+  }
+
+  ws.on('message', (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      wsSend(ws, { type: 'error', error: 'Invalid JSON' });
+      return;
+    }
+
+    // Handle greeting request
+    if (msg.type === 'greet') {
+      console.log(`[${ts()}] WS → greet`);
+      getGreeting().then((greeting) => {
+        console.log(`[${ts()}] WS ← greet: ${greeting.slice(0, 80)}`);
+        wsSend(ws, { type: 'greeting', text: greeting });
+      }).catch((err) => {
+        console.error(`[${ts()}] WS GREET ERROR:`, err.message);
+        wsSend(ws, { type: 'greeting', text: `Hey! ${AGENT_NAME} here.` });
+      });
+      return;
+    }
+
+    // Handle audio chunk — forward to whisper sidecar
+    if (msg.type === 'audio') {
+      if (!msg.data) {
+        wsSend(ws, { type: 'error', error: 'Missing "data" field in audio message' });
+        return;
+      }
+      whisperSendChunk(whisperSessionId, msg.data)
+        .then((result) => {
+          if (result.text) {
+            wsSend(ws, { type: 'transcript', text: result.text, final: false });
+          }
+        })
+        .catch((err) => {
+          console.error(`[${ts()}] WHISPER CHUNK ERROR:`, err.message);
+          // Non-fatal: don't disconnect, just skip this partial
+        });
+      return;
+    }
+
+    // Handle end of speech — finalize transcription, then send to LLM
+    if (msg.type === 'end_of_speech') {
+      console.log(`[${ts()}] WS → end_of_speech`);
+      whisperFinalize(whisperSessionId)
+        .then((result) => {
+          const finalText = (result.text || '').trim();
+          console.log(`[${ts()}] WHISPER FINAL: ${finalText.slice(0, 120)}`);
+          wsSend(ws, { type: 'transcript', text: finalText, final: true });
+
+          if (!finalText) {
+            console.log(`[${ts()}] Empty transcription, skipping LLM`);
+            return;
+          }
+
+          // Stream the LLM response
+          streamLLMResponse(finalText);
+        })
+        .catch((err) => {
+          console.error(`[${ts()}] WHISPER FINALIZE ERROR:`, err.message);
+          wsSend(ws, { type: 'error', error: `Transcription failed: ${err.message}` });
+        });
+      return;
+    }
+
+    // Handle text messages (existing behavior)
+    if (msg.type === 'text' && msg.text) {
+      const text = msg.text;
+      console.log(`[${ts()}] WS → ${text.slice(0, 120)}`);
+      streamLLMResponse(text);
+      return;
+    }
+
+    wsSend(ws, { type: 'error', error: 'Unknown message type. Expected "text", "greet", "audio", or "end_of_speech".' });
   });
 
   ws.on('close', () => {
-    console.log(`[${ts()}] WS disconnected`);
+    console.log(`[${ts()}] WS disconnected (session=${whisperSessionId})`);
     if (activeRequest) {
       try { activeRequest.destroy(); } catch {}
       activeRequest = null;
     }
+    // Clean up whisper session
+    whisperCancel(whisperSessionId).catch(() => {});
   });
 });
 
@@ -518,4 +633,5 @@ server.listen(PORT, BIND, () => {
   console.log(`  Auth: ${AUTH_TOKEN ? 'enabled' : 'disabled (set VOICE_CHAT_TOKEN to enable)'}`);
   console.log(`  Timeout: ${READ_TIMEOUT}ms`);
   console.log(`  WebSocket: ws://${BIND}:${PORT}/ws`);
+  console.log(`  Whisper sidecar: ${WHISPER_SERVICE_URL}`);
 });
